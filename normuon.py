@@ -1,6 +1,22 @@
 import torch
 import torch.distributed as dist
 
+
+def apply_cautious_weight_decay(p: torch.Tensor, update: torch.Tensor, lr: float, weight_decay: float) -> None:
+    """Apply weight decay only where the update and parameter signs align.
+
+    Standard decoupled weight decay blindly shrinks every weight toward zero.
+    Cautious Weight Decay (CWD, arXiv:2510.12402) masks out the decay when it
+    would oppose the optimizer's update direction, preventing regularization
+    from fighting the orthogonalized geometry that NorMuon produces.
+
+    The mask uses the *post-orthogonalization* update from NorMuon so the
+    alignment check reflects the final, conditioned step direction.
+    """
+    mask = (update * p) >= 0
+    p.copy_(torch.where(mask, p * (1.0 - lr * weight_decay), p))
+
+
 # copied from https://github.com/KellerJordan/Muon/blob/master/muon.py
 def zeropower_via_newtonschulz5(G, steps=5):
     """
@@ -88,9 +104,10 @@ class NorMuon(torch.optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(p)
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                     update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"], beta=group["momentum"], beta2=group["beta2"])
+                    update = update.reshape(p.shape)
                     if group["weight_decay"] and had_grad:
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                        apply_cautious_weight_decay(p, update, group["lr"], group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
 
         return loss
@@ -123,9 +140,10 @@ class SingleDeviceNorMuon(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(p)
                     state["second_momentum_buffer"] = torch.zeros_like(p[...,0:1])
                 update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"], beta=group["momentum"], beta2=group["beta2"])
+                update = update.reshape(p.shape)
                 if group["weight_decay"] and had_grad:
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                    apply_cautious_weight_decay(p, update, group["lr"], group["weight_decay"])
+                p.add_(update, alpha=-group["lr"])
 
         return loss
 
@@ -185,9 +203,10 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
                             state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                         update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
                                                 beta=group["momentum"], beta2=group["beta2"])
+                        update = update.reshape(p.shape)
                         if group["weight_decay"] and had_grad:
-                            p.mul_(1 - group["lr"] * group["weight_decay"])
-                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                            apply_cautious_weight_decay(p, update, group["lr"], group["weight_decay"])
+                        p.add_(update, alpha=-group["lr"])
                     dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
             else:
                 for p in group["params"]:
@@ -203,7 +222,7 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
                     update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
                                          state["step"], group["betas"], group["eps"])
                     if group["weight_decay"] and had_grad:
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                        apply_cautious_weight_decay(p, update, group["lr"], group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
 
         return loss
@@ -250,9 +269,10 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                     update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
                                             beta=group["momentum"], beta2=group["beta2"])
+                    update = update.reshape(p.shape)
                     if group["weight_decay"] and had_grad:
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                        apply_cautious_weight_decay(p, update, group["lr"], group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
             else:
                 for p in group["params"]:
                     had_grad = p.grad is not None
@@ -267,7 +287,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                     update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
                                          state["step"], group["betas"], group["eps"])
                     if group["weight_decay"] and had_grad:
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                        apply_cautious_weight_decay(p, update, group["lr"], group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
 
         return loss
